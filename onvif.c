@@ -1026,7 +1026,7 @@ rpc_set_encoder(struct ubus_context *ctx, struct ubus_object *obj,
 					conf->H264->GovLength = blobmsg_get_u32(tb_config[CONFIG_GOVLENGTH]);
 				}
 				if (tb_config[CONFIG_PROFILE]) {
-					conf->H264->H264Profile = blobmsg_get_u32(tb_config[CONFIG_PROFILE]);
+					HANDLE_SOAP_ERROR(soap_s2tt__H264Profile(soap, blobmsg_data(tb_config[CONFIG_PROFILE]), &(conf->H264->H264Profile)));
 				}
 				break;
 
@@ -1039,7 +1039,7 @@ rpc_set_encoder(struct ubus_context *ctx, struct ubus_object *obj,
 					conf->MPEG4->GovLength = blobmsg_get_u32(tb_config[CONFIG_GOVLENGTH]);
 				}
 				if (tb_config[CONFIG_PROFILE]) {
-					conf->MPEG4->Mpeg4Profile = blobmsg_get_u32(tb_config[CONFIG_PROFILE]);
+					HANDLE_SOAP_ERROR(soap_s2tt__Mpeg4Profile(soap, blobmsg_data(tb_config[CONFIG_PROFILE]), &(conf->MPEG4->Mpeg4Profile)));
 				}
 				break;
 
