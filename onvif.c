@@ -41,6 +41,53 @@ static const int DEFAULT_PROBE_TIMEOUT_SECS = 1;
 static const char *IMAGING_NAMESPACE = "http://www.onvif.org/ver20/imaging/wsdl";
 static const char *MEDIA_NAMESPACE = "http://www.onvif.org/ver10/media/wsdl";
 
+/* JSON doesn't distinguish between ints/floats, but the JSON-C library does, and libubox
+ * uses this to pack stuff appropriately. In our case, this is quite annoying, because
+ * by default if something doesn't match our policy type it's discarded.
+ *
+ * i.e. if you're expecting a float, and get passed '1', this is packed into the blobmsg
+ * as an int, and if you have a type in the policy of float it will get tossed out.
+ * Moreover, if you have an int32 which exceeds the range, this can also happen!
+ * blobmsg has a special type for this int only cast situation (BLOBMSG_CAST_INT64),
+ * but we have to replicate this for floats as well...
+ */
+static inline int64_t blobmsg_cast_int64(struct blob_attr *attr)
+{
+	int64_t tmp = 0;
+
+	if (blobmsg_type(attr) == BLOBMSG_TYPE_INT64)
+		tmp = blobmsg_get_u64(attr);
+	else if (blobmsg_type(attr) == BLOBMSG_TYPE_INT32)
+		tmp = (int32_t)blobmsg_get_u32(attr);
+	else if (blobmsg_type(attr) == BLOBMSG_TYPE_INT16)
+		tmp = (int16_t)blobmsg_get_u16(attr);
+	else if (blobmsg_type(attr) == BLOBMSG_TYPE_INT8)
+		tmp = (int8_t)blobmsg_get_u8(attr);
+	else if (blobmsg_type(attr) == BLOBMSG_TYPE_DOUBLE)
+		tmp = blobmsg_get_double(attr);
+
+	return tmp;
+}
+
+static inline double blobmsg_cast_double(struct blob_attr *attr)
+{
+	double tmp = 0;
+
+	if (blobmsg_type(attr) == BLOBMSG_TYPE_INT64)
+		tmp = blobmsg_get_u64(attr);
+	else if (blobmsg_type(attr) == BLOBMSG_TYPE_INT32)
+		tmp = (int32_t)blobmsg_get_u32(attr);
+	else if (blobmsg_type(attr) == BLOBMSG_TYPE_INT16)
+		tmp = (int16_t)blobmsg_get_u16(attr);
+	else if (blobmsg_type(attr) == BLOBMSG_TYPE_INT8)
+		tmp = (int8_t)blobmsg_get_u8(attr);
+	else if (blobmsg_type(attr) == BLOBMSG_TYPE_DOUBLE)
+		tmp = blobmsg_get_double(attr);
+
+	return tmp;
+}
+
+
 /* -----------------------------------------------------------------------------------------------
  * Shared SOAP stuff.
  */
@@ -253,7 +300,7 @@ enum {
 static const struct blobmsg_policy rpc_probe_policy[] = {
 	[RPC_PROBE_MULTICAST_IFNAME] = { .name = "multicast_ifname", .type = BLOBMSG_TYPE_STRING },
 	[RPC_PROBE_MULTICAST_IP] = { .name = "multicast_ip", .type = BLOBMSG_TYPE_STRING },
-	[RPC_PROBE_TIMEOUT_SECS] = { .name = "timeout_secs", .type = BLOBMSG_TYPE_INT32 },
+	[RPC_PROBE_TIMEOUT_SECS] = { .name = "timeout_secs", .type = BLOBMSG_TYPE_UNSPEC },
 };
 
 enum {
@@ -290,8 +337,8 @@ enum {
 };
 
 static const struct blobmsg_policy imaging_settings_policy[] = {
-	[SETTINGS_BRIGHTNESS] = { .name = "brightness", .type = BLOBMSG_TYPE_DOUBLE },
-	[SETTINGS_CONTRAST] = { .name = "contrast", .type = BLOBMSG_TYPE_DOUBLE },
+	[SETTINGS_BRIGHTNESS] = { .name = "brightness", .type = BLOBMSG_TYPE_UNSPEC },
+	[SETTINGS_CONTRAST] = { .name = "contrast", .type = BLOBMSG_TYPE_UNSPEC },
 };
 
 enum {
@@ -323,10 +370,10 @@ enum {
 static const struct blobmsg_policy encoder_config_policy[] = {
 	[CONFIG_ENCODING] = { .name = "encoding", .type = BLOBMSG_TYPE_STRING },
 	[CONFIG_PROFILE] = { .name = "profile", .type = BLOBMSG_TYPE_STRING },
-	[CONFIG_QUALITY] = { .name = "quality", .type = BLOBMSG_TYPE_INT32 },
-	[CONFIG_GOVLENGTH] = { .name = "govlength", .type = BLOBMSG_TYPE_INT32 },
-	[CONFIG_FRAMERATE] = { .name = "framerate", .type = BLOBMSG_TYPE_INT32 },
-	[CONFIG_BITRATE] = { .name = "bitrate", .type = BLOBMSG_TYPE_INT32 },
+	[CONFIG_QUALITY] = { .name = "quality", .type = BLOBMSG_TYPE_UNSPEC },
+	[CONFIG_GOVLENGTH] = { .name = "govlength", .type = BLOBMSG_TYPE_UNSPEC },
+	[CONFIG_FRAMERATE] = { .name = "framerate", .type = BLOBMSG_TYPE_UNSPEC },
+	[CONFIG_BITRATE] = { .name = "bitrate", .type = BLOBMSG_TYPE_UNSPEC },
 	[CONFIG_RESOLUTION] = { .name = "resolution", .type = BLOBMSG_TYPE_TABLE },
 };
 
@@ -336,8 +383,8 @@ enum {
 };
 
 static const struct blobmsg_policy resolution_policy[] = {
-	[RESOLUTION_WIDTH] = { .name = "width", .type = BLOBMSG_TYPE_INT32 },
-	[RESOLUTION_HEIGHT] = { .name = "height", .type = BLOBMSG_TYPE_INT32 },
+	[RESOLUTION_WIDTH] = { .name = "width", .type = BLOBMSG_TYPE_UNSPEC },
+	[RESOLUTION_HEIGHT] = { .name = "height", .type = BLOBMSG_TYPE_UNSPEC },
 };
 
 enum {
@@ -819,7 +866,7 @@ rpc_probe(struct ubus_context *ctx, struct ubus_object *obj,
 		soap->ipv4_multicast_if = (char *)&(sin_addr);
 	}
 	if (tb[RPC_PROBE_TIMEOUT_SECS]) {
-		timeout_secs = blobmsg_get_u32(tb[RPC_PROBE_TIMEOUT_SECS]);
+		timeout_secs = blobmsg_cast_int64(tb[RPC_PROBE_TIMEOUT_SECS]);
 	}
 
 	HANDLE_SOAP_ERROR_BOOL(soap_valid_socket(soap_bind(soap, NULL, 0, 1000)));
@@ -908,14 +955,14 @@ rpc_set_imaging(struct ubus_context *ctx, struct ubus_object *obj,
 		if (!settings->Brightness) {
 			HANDLE_SOAP_ERROR_POINTER(settings->Brightness = soap_new_float(soap, 1));
 		}
-		*(settings->Brightness) = blobmsg_get_double(tb_settings[SETTINGS_BRIGHTNESS]);
+		*(settings->Brightness) = blobmsg_cast_double(tb_settings[SETTINGS_BRIGHTNESS]);
 	}
 
 	if (tb_settings[SETTINGS_CONTRAST]) {
 		if (!settings->Contrast) {
 			HANDLE_SOAP_ERROR_POINTER(settings->Contrast = soap_new_float(soap, 1));
 		}
-		*(settings->Contrast) = blobmsg_get_double(tb_settings[SETTINGS_CONTRAST]);
+		*(settings->Contrast) = blobmsg_cast_double(tb_settings[SETTINGS_CONTRAST]);
 	}
 
 	struct _timg__SetImagingSettings set_settings = {
@@ -1012,7 +1059,7 @@ rpc_set_encoder(struct ubus_context *ctx, struct ubus_object *obj,
 	}
 
 	if (tb_config[CONFIG_QUALITY]) {
-		conf->Quality = blobmsg_get_u32(tb_config[CONFIG_QUALITY]);
+		conf->Quality = blobmsg_cast_int64(tb_config[CONFIG_QUALITY]);
 	}
 
 	if (tb_config[CONFIG_GOVLENGTH] || tb_config[CONFIG_PROFILE]) {
@@ -1023,7 +1070,7 @@ rpc_set_encoder(struct ubus_context *ctx, struct ubus_object *obj,
 					*(conf->H264) = H264_CONFIGURATION_DEFAULTS;
 				}
 				if (tb_config[CONFIG_GOVLENGTH]) {
-					conf->H264->GovLength = blobmsg_get_u32(tb_config[CONFIG_GOVLENGTH]);
+					conf->H264->GovLength = blobmsg_cast_int64(tb_config[CONFIG_GOVLENGTH]);
 				}
 				if (tb_config[CONFIG_PROFILE]) {
 					HANDLE_SOAP_ERROR(soap_s2tt__H264Profile(soap, blobmsg_data(tb_config[CONFIG_PROFILE]), &(conf->H264->H264Profile)));
@@ -1036,7 +1083,7 @@ rpc_set_encoder(struct ubus_context *ctx, struct ubus_object *obj,
 					*(conf->MPEG4) = MPEG4_CONFIGURATION_DEFAULTS;
 				}
 				if (tb_config[CONFIG_GOVLENGTH]) {
-					conf->MPEG4->GovLength = blobmsg_get_u32(tb_config[CONFIG_GOVLENGTH]);
+					conf->MPEG4->GovLength = blobmsg_cast_int64(tb_config[CONFIG_GOVLENGTH]);
 				}
 				if (tb_config[CONFIG_PROFILE]) {
 					HANDLE_SOAP_ERROR(soap_s2tt__Mpeg4Profile(soap, blobmsg_data(tb_config[CONFIG_PROFILE]), &(conf->MPEG4->Mpeg4Profile)));
@@ -1057,10 +1104,10 @@ rpc_set_encoder(struct ubus_context *ctx, struct ubus_object *obj,
 		}
 
 		if (tb_config[CONFIG_FRAMERATE]) {
-			conf->RateControl->FrameRateLimit = blobmsg_get_u32(tb_config[CONFIG_FRAMERATE]);
+			conf->RateControl->FrameRateLimit = blobmsg_cast_int64(tb_config[CONFIG_FRAMERATE]);
 		}
 		if (tb_config[CONFIG_BITRATE]) {
-			conf->RateControl->BitrateLimit = blobmsg_get_u32(tb_config[CONFIG_BITRATE]);
+			conf->RateControl->BitrateLimit = blobmsg_cast_int64(tb_config[CONFIG_BITRATE]);
 		}
 	}
 
@@ -1069,10 +1116,10 @@ rpc_set_encoder(struct ubus_context *ctx, struct ubus_object *obj,
 		blobmsg_parse(resolution_policy, ARRAY_SIZE(resolution_policy), tb_res, blobmsg_data(tb_config[CONFIG_RESOLUTION]), blobmsg_len(tb_config[CONFIG_RESOLUTION]));
 
 		if (tb_res[RESOLUTION_WIDTH]) {
-			conf->Resolution->Width = blobmsg_get_u32(tb_res[RESOLUTION_WIDTH]);
+			conf->Resolution->Width = blobmsg_cast_int64(tb_res[RESOLUTION_WIDTH]);
 		}
 		if (tb_res[RESOLUTION_HEIGHT]) {
-			conf->Resolution->Height = blobmsg_get_u32(tb_res[RESOLUTION_HEIGHT]);
+			conf->Resolution->Height = blobmsg_cast_int64(tb_res[RESOLUTION_HEIGHT]);
 		}
 	}
 
