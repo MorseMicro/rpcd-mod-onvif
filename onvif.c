@@ -18,10 +18,13 @@
  */
 
 #include <sys/types.h>
+#include <time.h>
 #include <ifaddrs.h>
+#include <string.h>
 
 #include <libubus.h>
 #include <rpcd/plugin.h>
+#include <libubox/kvlist.h>
 
 #include "soapH.h"
 #include "soap.nsmap"
@@ -95,6 +98,10 @@ static inline double blobmsg_cast_double(struct blob_attr *attr)
 static struct soap *my_soap_init()
 {
 	struct soap *soap = soap_new2(SOAP_XML_STRICT | SOAP_XML_CANONICAL | SOAP_C_UTFSTRING | SOAP_IO_KEEPALIVE, SOAP_IO_KEEPALIVE);
+	if (soap == NULL) {
+		return NULL;
+	}
+
 	soap_set_namespaces(soap, soap_namespaces);
 	soap_register_plugin(soap, soap_wsse);
 
@@ -165,6 +172,7 @@ enum ubus_msg_status handle_soap_error(struct soap *soap)
 		case SOAP_TCP_ERROR:
 		case SOAP_UDP_ERROR:
 			status = UBUS_STATUS_CONNECTION_FAILED;
+			break;
 		default:
 			status = UBUS_STATUS_UNKNOWN_ERROR;
 			break;
@@ -181,20 +189,20 @@ enum ubus_msg_status handle_soap_error(struct soap *soap)
 
 #define HANDLE_SOAP_ERROR(fn) \
 if (SOAP_OK != (fn)) { \
-	fprintf(stderr, "onvif: error on line %d calling: %s\n", __LINE__, #fn); \
-	return handle_soap_error(soap);\
+	fprintf(stderr, "onvif: soap error %d on line %d calling: %s\n", soap->error, __LINE__, #fn); \
+	return handle_soap_error(soap); \
 }
 
 #define HANDLE_SOAP_ERROR_POINTER(x) \
 if (NULL == (x)) { \
-	fprintf(stderr, "onvif: error on line %d calling: %s\n", __LINE__, #x); \
+	fprintf(stderr, "onvif: soap error %d on line %d calling: %s\n", soap->error, __LINE__, #x); \
 	return handle_soap_error(soap);\
 }
 
 #define HANDLE_SOAP_ERROR_BOOL(x) \
 if (!(x)) { \
-	fprintf(stderr, "onvif: error on line %d calling: %s\n", __LINE__, #x); \
-	return handle_soap_error(soap);\
+	fprintf(stderr, "onvif: soap error %d on line %d calling: %s\n", soap->error, __LINE__, #x); \
+	return handle_soap_error(soap); \
 }
 
 #define HANDLE_ALLOC_ERROR(fn) \
@@ -210,6 +218,48 @@ if (NULL == (res)) { \
 	my_soap_cleanup(soap); \
 	return UBUS_STATUS_UNKNOWN_ERROR; \
 }
+
+/* We cache our probe responses; ugly way of pretending to be more daemon like.
+ *
+ * (currently, because we're just a plugin, I think unless we start another thread
+ * we only get to run code in response to user interactions...)
+ */
+
+const int MAX_PROBE_CACHE_SECS = 2 * 60 * 60;  // 2 hours
+
+// Because the probe responses are a bit erratic (UDP, weak network, etc.),
+// and we don't have a proper daemon, we work around this by retaining a cache
+// of probe responses and use this to respond to probes
+// (provided that the previous good response was within 1 hour).
+// We use device_url as the 'key' rather than endpoint_reference_address
+// for simplicity.
+struct probe_response {
+	time_t time;  // When we last received a response to this probe.
+	char *endpoint_reference_address;
+	char *device_url;
+	char *types;
+	char *scopes;
+};
+
+static void probe_response_free(struct probe_response *probe_response) {
+	free(probe_response->endpoint_reference_address);
+	free(probe_response->device_url);
+	if (probe_response->types != NULL) {
+		free(probe_response->types);
+	}
+	if (probe_response->scopes != NULL) {
+		free(probe_response->scopes);
+	}
+
+	*probe_response = (struct probe_response){0};
+}
+
+static int probe_response_length(struct kvlist *kv, const void *data) {
+	return sizeof(struct probe_response);
+}
+
+static struct kvlist probe_responses;
+
 
 /* -----------------------------------------------------------------------------------------------
  * WSDD (WS-Discovery) handlers - unused except for ProbeMatches.
@@ -228,26 +278,48 @@ soap_wsdd_mode wsdd_event_Probe(struct soap *soap, const char *MessageID, const 
 
 void wsdd_event_ProbeMatches(struct soap *soap, unsigned int InstanceId, const char *SequenceId, unsigned int MessageNumber, const char *MessageID, const char *RelatesTo, struct wsdd__ProbeMatchesType *ProbeMatches)
 { 
-	/* The assumption is that if we're receiving this event we've already setup buf so that we can
-	 * shove our responses into it.
+	/* The assumption is that if we're receiving this event we've already initialised probe_responses
+	 * (and that the events are not threaded).
 	 */
 	for (int i = 0; i < ProbeMatches->__sizeProbeMatch; ++i) {
-		void *tbl = blobmsg_open_table(&buf, NULL);
-		if (tbl == NULL) {
-			goto error;
-		}
 		struct wsdd__ProbeMatchType *probe_match = &(ProbeMatches->ProbeMatch[i]);
-		if (0 != blobmsg_add_string(&buf, "endpoint_reference_address", probe_match->wsa5__EndpointReference.Address)) goto error;
-		if (NULL != probe_match->XAddrs) {
-			if (0 != blobmsg_add_string(&buf, "device_url", probe_match->XAddrs)) goto error;
+		if (NULL == probe_match->XAddrs) {
+			fprintf(stderr, "onvif: probe response with no device_url (XAddrs).\n");
+			continue;
 		}
-		if (NULL != probe_match->Types) {
-			if (0 != blobmsg_add_string(&buf, "types", probe_match->Types)) goto error;
+		if (probe_match->wsa5__EndpointReference.Address == NULL) {
+			fprintf(stderr, "onvif: probe response with no endpoint_reference_address.\n");
+			continue;
 		}
-		if (NULL != probe_match->Scopes) {
-			if (0 != blobmsg_add_string(&buf, "scopes", probe_match->Scopes->__item)) goto error;
+
+		struct probe_response *response = kvlist_get(&probe_responses, probe_match->XAddrs);
+
+		if (response != NULL) {
+			response->time = time(NULL);
+		} else {
+			struct probe_response new_response = {0};
+			response = &new_response;
+
+			response->time = time(NULL);
+
+			if (NULL == (response->endpoint_reference_address = strdup(probe_match->wsa5__EndpointReference.Address))) goto error;
+			if (NULL == (response->device_url = strdup(probe_match->XAddrs))) goto error;
+
+			if (probe_match->Types == NULL) {
+				fprintf(stderr, "onvif: probe response with no types.\n");
+				response->types = NULL;
+			} else {
+				if (NULL == (response->types = strdup(probe_match->Types))) goto error;
+			}
+			if (probe_match->Scopes == NULL || probe_match->Scopes->__item == NULL) {
+				fprintf(stderr, "onvif: probe response with no scopes.\n");
+				response->scopes = NULL;
+			} else {
+				if (NULL == (response->scopes = strdup(probe_match->Scopes->__item))) goto error;
+			}
+
+			kvlist_set(&probe_responses, response->device_url, response);
 		}
-		blobmsg_close_table(&buf, tbl);
 	}
 
 	return;
@@ -295,12 +367,14 @@ enum {
 	RPC_PROBE_MULTICAST_IFNAME,
 	RPC_PROBE_MULTICAST_IP,
 	RPC_PROBE_TIMEOUT_SECS,
+	RPC_PROBE_CLEAR_CACHE,
 };
 
 static const struct blobmsg_policy rpc_probe_policy[] = {
 	[RPC_PROBE_MULTICAST_IFNAME] = { .name = "multicast_ifname", .type = BLOBMSG_TYPE_STRING },
 	[RPC_PROBE_MULTICAST_IP] = { .name = "multicast_ip", .type = BLOBMSG_TYPE_STRING },
 	[RPC_PROBE_TIMEOUT_SECS] = { .name = "timeout_secs", .type = BLOBMSG_TYPE_UNSPEC },
+	[RPC_PROBE_CLEAR_CACHE] = { .name = "clear_cache", .type = BLOBMSG_TYPE_UNSPEC },
 };
 
 enum {
@@ -797,7 +871,7 @@ rpc_info(struct ubus_context *ctx, struct ubus_object *obj,
 
 	ubus_send_reply(ctx, req, buf.head);
 
-	/* We don't free buf; it just get re-used on the next init. */
+	/* We don't free buf; it just gets re-used on the next init. */
 
 	my_soap_cleanup(soap);
 	return UBUS_STATUS_OK;
@@ -828,6 +902,7 @@ static int _get_ip_from_ifname(char *ifname, struct in_addr *sin_addr)
 	return 0;
 }
 
+
 /**
  * Probe via UDP multicast and wait for WS-Discovery responses.
  * 
@@ -847,6 +922,7 @@ rpc_probe(struct ubus_context *ctx, struct ubus_object *obj,
 	struct soap *soap = soap_new1(SOAP_IO_UDP);
 	soap_set_namespaces(soap, soap_namespaces);
 	int timeout_secs = DEFAULT_PROBE_TIMEOUT_SECS;
+	int clear_cache = 0;
 
 	struct in_addr sin_addr;
 	if (tb[RPC_PROBE_MULTICAST_IFNAME]) {
@@ -868,35 +944,81 @@ rpc_probe(struct ubus_context *ctx, struct ubus_object *obj,
 	if (tb[RPC_PROBE_TIMEOUT_SECS]) {
 		timeout_secs = blobmsg_cast_int64(tb[RPC_PROBE_TIMEOUT_SECS]);
 	}
+	if (tb[RPC_PROBE_CLEAR_CACHE]) {
+		clear_cache = blobmsg_cast_int64(tb[RPC_PROBE_CLEAR_CACHE]);
+	}
+
+	if (clear_cache) {
+		const char *device_url;
+		struct probe_response *probe_response;
+		kvlist_for_each(&probe_responses, device_url, probe_response) {
+			probe_response_free(probe_response);
+		}
+		kvlist_free(&probe_responses);
+		kvlist_init(&probe_responses, probe_response_length);
+	}
 
 	HANDLE_SOAP_ERROR_BOOL(soap_valid_socket(soap_bind(soap, NULL, 0, 1000)));
 
 	HANDLE_SOAP_ERROR(soap_wsdd_Probe(soap, SOAP_WSDD_ADHOC, SOAP_WSDD_TO_TS, MULTICAST_URL,
 	                                  soap_wsa_rand_uuid(soap), NULL, "tdn:NetworkVideoTransmitter", NULL, ""));
 
-	HANDLE_ALLOC_ERROR(blob_buf_init(&buf, 0));
-
-	/* Open an array for our devices when we listen to probe responses we can insert them */
-	void *tbl = blobmsg_open_array(&buf, "devices");
-	HANDLE_ALLOC_ERROR_POINTER(tbl);
-
 	probe_error = false;
 	HANDLE_SOAP_ERROR(soap_wsdd_listen(soap, timeout_secs));
 
-	blobmsg_close_table(&buf, tbl);
-
-	my_soap_cleanup(soap);
-
-	/* We don't free buf; it just get re-used on the next init. */
-
 	if (probe_error) {
 		/* We assume the error message was spat out by the probe event handler */
+		my_soap_cleanup(soap);
 		return UBUS_STATUS_UNKNOWN_ERROR;
-	} else {
-		ubus_send_reply(ctx, req, buf.head);
-
-		return UBUS_STATUS_OK;
 	}
+
+	/* Finally we can build the actual response.
+	 */
+	HANDLE_ALLOC_ERROR(blob_buf_init(&buf, 0));
+	/* We don't free buf; it just get re-used on the next init. */
+
+	/* We use this to keep track of which device_urls to remove (stale cache).
+	 * This is because it's probably not safe to mutate a kvlist during iteration.
+	 */
+	static int MAX_REMOVALS = 100;
+	const char *device_urls_to_remove[MAX_REMOVALS];
+	int next_removal = 0;
+
+	const char *device_url;
+	struct probe_response *probe_response;
+	void *tbl = blobmsg_open_array(&buf, "devices");
+	const time_t current_time = time(NULL);
+	HANDLE_ALLOC_ERROR_POINTER(tbl);
+	kvlist_for_each(&probe_responses, device_url, probe_response) {
+		/* Stale cache entries are ignored and flagged for removal (see below) */
+		if (next_removal < MAX_REMOVALS && probe_response->time + MAX_PROBE_CACHE_SECS < current_time) {
+			device_urls_to_remove[next_removal++] = device_url;
+			continue;
+		}
+
+		void *tbl = blobmsg_open_table(&buf, NULL);
+		HANDLE_ALLOC_ERROR_POINTER(tbl);
+		HANDLE_ALLOC_ERROR(blobmsg_add_string(&buf, "endpoint_reference_address", probe_response->endpoint_reference_address));
+		HANDLE_ALLOC_ERROR(blobmsg_add_string(&buf, "device_url", probe_response->device_url));
+		HANDLE_ALLOC_ERROR(blobmsg_add_string(&buf, "types", probe_response->types != NULL ? probe_response->types : ""));
+		HANDLE_ALLOC_ERROR(blobmsg_add_string(&buf, "scopes", probe_response->scopes != NULL ? probe_response->scopes : ""));
+		HANDLE_ALLOC_ERROR(blobmsg_add_u64(&buf, "last_seen_time", probe_response->time));
+		blobmsg_close_table(&buf, tbl);
+	}
+
+	blobmsg_close_table(&buf, tbl);
+
+	ubus_send_reply(ctx, req, buf.head);
+
+	/* Now we've finished, let's clean up the cache.
+	 */
+	for (int i = 0; i < next_removal; ++i) {
+		probe_response_free(kvlist_get(&probe_responses, device_urls_to_remove[i]));
+		kvlist_delete(&probe_responses, device_urls_to_remove[i]);
+	}
+
+	my_soap_cleanup(soap);
+	return UBUS_STATUS_OK;
 }
 
 /**
@@ -1309,6 +1431,8 @@ static int rpc_onvif_api_init(const struct rpc_daemon_ops *o, struct ubus_contex
 		.methods = onvif_methods,
 		.n_methods = ARRAY_SIZE(onvif_methods),
 	};
+
+	kvlist_init(&probe_responses, probe_response_length);
 
 	return ubus_add_object(ctx, &onvif_object);
 }
